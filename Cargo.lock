@@ -1187,6 +1187,7 @@ dependencies = [
 name = "elster_ident"
 version = "0.1.0"
 dependencies = [
+ "eyre",
  "http-body-util",
  "hyper 1.2.0",
  "hyper-util",
@@ -1194,6 +1195,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde_json",
+ "structopt",
  "tlsn-core",
  "tlsn-prover",
  "tokio",
