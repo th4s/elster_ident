@@ -21,6 +21,6 @@ COOKIE='<COOKIE-VALUE>' cargo run --bin prover --release
 ```
 5. Wait until the notarization is finished, should be 1-2 minutes.
 6. Go to <https://tlsnotary.github.io/proof_viz/> and drop your
-   `elster-proof.json` there, which was generated during the notarization.
+   `elster_proof.json` there, which was generated during the notarization.
    Search for your name or birthday.
 7. Congrats you just proved your identity using TLSNotary and Elster.
