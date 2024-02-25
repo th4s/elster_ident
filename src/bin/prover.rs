@@ -194,7 +194,7 @@ pub async fn request_notarization(
     max_transcript_size: Option<usize>,
 ) -> (tokio_rustls::client::TlsStream<TcpStream>, String) {
     // Connect to the Notary via TLS-TCP
-    let pem_file = std::str::from_utf8(include_bytes!("../../fixtures/rootCA.crt")).unwrap();
+    let pem_file = std::str::from_utf8(include_bytes!("../../fixture/tls/rootCA.crt")).unwrap();
     let mut reader = std::io::BufReader::new(pem_file.as_bytes());
     let mut certificates: Vec<Certificate> = rustls_pemfile::certs(&mut reader)
         .unwrap()
