@@ -22,6 +22,8 @@ tlsn-core = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.4" 
 tlsn-prover = { git = "https://github.com/tlsnotary/tlsn", features = ["tracing"], tag = "v0.1.0-alpha.4" }
 notary-server = {  git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.4" }
 
+headless_chrome = {git = "https://github.com/rust-headless-chrome/rust-headless-chrome", features = ["fetch"]}
+qr2term = "0.3.1"
 
 [[bin]]
 name = "prover"

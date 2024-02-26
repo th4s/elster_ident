@@ -4,18 +4,25 @@ use hyper::{body::Bytes, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use notary_server::{ClientType, NotarizationSessionRequest, NotarizationSessionResponse};
 use rustls::{Certificate, ClientConfig, RootCertStore};
+use tokio::time::sleep;
 /// This example shows how to notarize an Elster identity.
 ///
 /// The example uses the notary server from <https://github.com/tlsnotary/tlsn/tree/v0.1.0-alpha.4/notary-server>.
 use std::ops::Range;
 use std::sync::Arc;
-use tlsn_core::{commitment::CommitmentKind, proof::TlsProof};
+use std::time::Duration;
+use tlsn_core::proof::TlsProof;
 use tlsn_prover::tls::{Prover, ProverConfig};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::debug;
+
+use headless_chrome::{Browser, protocol::cdp::Network::Cookie, LaunchOptions};
+use headless_chrome::browser::default_executable;
+use qr2term;
+
 
 // Setting of the application server
 const SERVER_DOMAIN: &str = "www.elster.de";
@@ -30,6 +37,81 @@ const NOTARY_MAX_TRANSCRIPT_SIZE: usize = 360000;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    let launch_options = LaunchOptions::default_builder()
+        .path(Some(default_executable().unwrap()))
+        .idle_browser_timeout(Duration::from_secs(180))
+        .build().unwrap();
+    let browser = Browser::new(launch_options).unwrap();
+    let tab = browser.new_tab().unwrap();
+
+    let mut navigation_counter = 0;
+    let qr_code;
+
+    // Sometimes Elster does not provide a QR code at first try? Try 5 times...
+    'navigation: loop {
+        println!("Navigating to Elster Secure");
+        tab.navigate_to("https://www.elster.de/eportal/login/elstersecure").unwrap();
+    
+        let qr_element = tab.wait_for_element("div#elsterSecure-data").unwrap();
+        println!("Waiting for QR code...");
+        let div_attribute = qr_element.get_attribute_value("data-client-uri").unwrap();
+        let mut qr_code_search_counter = 0;
+        'qr_code: loop {
+            match div_attribute {
+                Some(value) => {
+                    qr_code = value;
+                    break 'navigation;
+                },
+                None => {
+                    sleep(Duration::from_millis(100)).await;
+                    qr_code_search_counter = qr_code_search_counter + 1;
+                    if qr_code_search_counter > 30 {
+                        break 'qr_code;
+                    }
+                }
+            }
+        }
+        navigation_counter = navigation_counter + 1;
+        if navigation_counter > 5 {
+            println!("Unable to fetch QR code from ElsterSecure. Exiting");
+            std::process::exit(-1);
+        }
+    }
+
+    qr2term::print_qr(qr_code).unwrap();
+    let mut wait_counter = 0;
+    let logout_button;
+    loop {
+        // default tab timeout is 20... alternatively change default timeout of tab
+        match tab.wait_for_element("button#logoutButton") {
+            Ok(value) => {
+                logout_button = value;
+                break;
+            },
+            Err(_) => {
+                // wait 
+                wait_counter = wait_counter + 1;
+                println!("Waiting...");
+                if wait_counter > 10 {
+                    println!("Login timedout");
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+    let cookies: Vec<Cookie> = tab.get_cookies().unwrap();
+    let mut session_cookie = None;
+    for cookie in cookies.iter() {
+        if cookie.name == "JSESSIONID" {
+            session_cookie = Some(format!("{}={}", cookie.name, cookie.value));
+        }
+    };
+    if session_cookie == None {
+        let _ = logout_button.click();
+        println!("Failed to extract cookie from login.");
+        std::process::exit(-1);
+    }
+    let session_cookie = session_cookie.unwrap();
 
     let (notary_tls_socket, session_id) =
         request_notarization(NOTARY_HOST, NOTARY_PORT, Some(NOTARY_MAX_TRANSCRIPT_SIZE)).await;
@@ -70,7 +152,6 @@ async fn main() {
     // Spawn the HTTP task to be run concurrently
     tokio::spawn(connection);
 
-    let cookie_str = std::env::var("COOKIE").unwrap();
     // Build a simple HTTP request
     let request = Request::builder()
         .uri("/eportal/meinestammdaten")
@@ -84,7 +165,7 @@ async fn main() {
             "User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
         )
-        .header("Cookie", cookie_str)
+        .header("Cookie", &session_cookie)
         .body(Empty::<Bytes>::new())
         .unwrap();
 
@@ -114,19 +195,26 @@ async fn main() {
     // Upgrade the prover to an HTTP prover, and start notarization.
     let mut prover = prover.start_notarize();
 
-    let sent_len = prover.sent_transcript().data().len();
-    let recv_len = prover.recv_transcript().data().len();
+
+    let sent_public_ranges = find_excluded(
+        prover.sent_transcript().data(),
+        &[session_cookie.as_bytes()]);
+    let recv_public_ranges = find_identity_fields(
+        prover.recv_transcript().data()
+    );
 
     let commitment_builder = prover.commitment_builder();
 
-    let _sent_id = commitment_builder.commit_sent(&Range {
-        start: 0,
-        end: sent_len,
-    });
-    let _recv_id = commitment_builder.commit_recv(&Range {
-        start: 0,
-        end: recv_len,
-    });
+    // Commit to each range of the public outbound data which we want to disclose
+    let sent_commitments: Vec<_> = sent_public_ranges
+        .iter()
+        .map(|range| commitment_builder.commit_sent(range).unwrap())
+        .collect();
+    // Commit to each range of the public inbound data which we want to disclose
+    let recv_commitments: Vec<_> = recv_public_ranges
+        .iter()
+        .map(|range| commitment_builder.commit_recv(range).unwrap())
+        .collect();
 
     // Finalize, returning the notarized HTTP session
     let notarized_session = prover.finalize().await.unwrap();
@@ -149,28 +237,13 @@ async fn main() {
 
     let mut proof_builder = notarized_session.data().build_substrings_proof();
 
-    let sent_len = notarized_session.data().sent_transcript().data().len();
-    let recv_len = notarized_session.data().recv_transcript().data().len();
-
-    proof_builder
-        .reveal_sent(
-            &Range {
-                start: 0,
-                end: sent_len,
-            },
-            CommitmentKind::Blake3,
-        )
-        .unwrap();
-
-    proof_builder
-        .reveal_recv(
-            &Range {
-                start: 0,
-                end: recv_len,
-            },
-            CommitmentKind::Blake3,
-        )
-        .unwrap();
+    // Reveal all the public ranges
+    for commitment_id in sent_commitments {
+        proof_builder.reveal_by_id(commitment_id).unwrap();
+    }
+    for commitment_id in recv_commitments {
+        proof_builder.reveal_by_id(commitment_id).unwrap();
+    }
 
     // Build the proof
     let substrings_proof = proof_builder.build().unwrap();
@@ -185,6 +258,8 @@ async fn main() {
     file.write_all(serde_json::to_string_pretty(&proof).unwrap().as_bytes())
         .await
         .unwrap();
+
+    let _ = logout_button.click();
 }
 
 /// Requests notarization from the Notary server.
@@ -304,4 +379,81 @@ pub async fn request_notarization(
         notary_tls_socket.into_inner(),
         notarization_response.session_id,
     )
+}
+
+
+fn find_excluded(seq: &[u8], private_seq: &[&[u8]]) -> Vec<Range<usize>> {
+    let mut private_ranges = Vec::new();
+    for s in private_seq {
+        for (idx, w) in seq.windows(s.len()).enumerate() {
+            if w == *s {
+                private_ranges.push(idx..(idx + w.len()));
+            }
+        }
+    }
+
+    let mut sorted_ranges = private_ranges.clone();
+    sorted_ranges.sort_by_key(|r| r.start);
+
+    let mut public_ranges = Vec::new();
+    let mut last_end = 0;
+    for r in sorted_ranges {
+        if r.start > last_end {
+            public_ranges.push(last_end..r.start);
+        }
+        last_end = r.end;
+    }
+
+    if last_end < seq.len() {
+        public_ranges.push(last_end..seq.len());
+    }
+
+    public_ranges
+}
+
+
+fn find_identity_fields(seq: &[u8]) -> Vec<Range<usize>> {
+    let fields = ["Identifikationsnummer", "Titel", "Vorname", "Nachname", "Geburtsdatum", "Anschrift"];
+    let close_div = "</div>".as_bytes();
+    let close_symbol = ">".as_bytes();
+    
+    let mut public_ranges = Vec::new();
+    // find start idx
+    let start_txt = "Angaben zur Person".as_bytes();
+
+    let mut start_idx = 0;
+    for (idx, w) in seq.windows(start_txt.len()).enumerate() {
+        if w == start_txt {
+            start_idx = idx;
+            break;
+        }
+    }
+    for field in fields.iter() {
+        let field_bytes = field.as_bytes();
+        'outer_id: for (idx, w) in seq.windows(field_bytes.len()).skip(start_idx).enumerate() {
+            if w == field_bytes {
+                // found field
+                public_ranges.push(start_idx + idx..start_idx + idx + w.len());
+                
+                // now find value
+                // skip a </div> now
+                let skip_idx = start_idx + idx + w.len() + close_div.len() + 1;
+                // a html tag follows < ... > , find where that one closes
+                for (j, symb) in seq.windows(1).skip(skip_idx).enumerate() {
+                    if symb == close_symbol {
+                        // idx+j+1 is start_idx
+                        // value ends with an </div>, when that comes the range ends
+                        for (k, w2) in seq.windows(close_div.len()).skip(skip_idx).enumerate() {
+                            if w2 == close_div {
+                                public_ranges.push(skip_idx+j+1..skip_idx+k);
+                                break 'outer_id;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public_ranges
 }
