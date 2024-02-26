@@ -4,11 +4,13 @@ use hyper::{body::Bytes, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use notary_server::{ClientType, NotarizationSessionRequest, NotarizationSessionResponse};
 use rustls::{Certificate, ClientConfig, RootCertStore};
+use tokio::time::sleep;
 /// This example shows how to notarize an Elster identity.
 ///
 /// The example uses the notary server from <https://github.com/tlsnotary/tlsn/tree/v0.1.0-alpha.4/notary-server>.
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 use tlsn_core::{commitment::CommitmentKind, proof::TlsProof};
 use tlsn_prover::tls::{Prover, ProverConfig};
 use tokio::io::AsyncWriteExt as _;
@@ -17,7 +19,8 @@ use tokio_rustls::TlsConnector;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::debug;
 
-use headless_chrome::{Browser, protocol::cdp::Network::Cookie};
+use headless_chrome::{Browser, protocol::cdp::Network::Cookie, LaunchOptions};
+use headless_chrome::browser::default_executable;
 use qr2term;
 
 
@@ -34,27 +37,68 @@ const NOTARY_MAX_TRANSCRIPT_SIZE: usize = 360000;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-
-    let browser = Browser::default().unwrap();
+    let launch_options = LaunchOptions::default_builder()
+        .path(Some(default_executable().unwrap()))
+        .idle_browser_timeout(Duration::from_secs(180))
+        .build().unwrap();
+    let browser = Browser::new(launch_options).unwrap();
     let tab = browser.new_tab().unwrap();
 
-    tab.navigate_to("https://www.elster.de/eportal/login/elstersecure").unwrap();
-
-    let qr_element = tab.wait_for_element("div#elsterSecure-data").unwrap();
-    let div_attribute = qr_element.get_attribute_value("data-client-uri").unwrap();
+    let mut navigation_counter = 0;
     let qr_code;
-    loop {
-        match div_attribute {
-            Some(value) => {
-                qr_code = value;
-                break;
-            },
-            None => {}
+
+    // Sometimes Elster does not provide a QR code at first try? Try 5 times...
+    'navigation: loop {
+        println!("Navigating to Elster Secure");
+        tab.navigate_to("https://www.elster.de/eportal/login/elstersecure").unwrap();
+    
+        let qr_element = tab.wait_for_element("div#elsterSecure-data").unwrap();
+        println!("Waiting for QR code...");
+        let div_attribute = qr_element.get_attribute_value("data-client-uri").unwrap();
+        let mut qr_code_search_counter = 0;
+        'qr_code: loop {
+            match div_attribute {
+                Some(value) => {
+                    qr_code = value;
+                    break 'navigation;
+                },
+                None => {
+                    sleep(Duration::from_millis(100)).await;
+                    qr_code_search_counter = qr_code_search_counter + 1;
+                    if qr_code_search_counter > 30 {
+                        break 'qr_code;
+                    }
+                }
+            }
+        }
+        navigation_counter = navigation_counter + 1;
+        if navigation_counter > 5 {
+            println!("Unable to fetch QR code from ElsterSecure. Exiting");
+            std::process::exit(-1);
         }
     }
 
     qr2term::print_qr(qr_code).unwrap();
-    let logout_button = tab.wait_for_element("button#logoutButton").unwrap();
+    let mut wait_counter = 0;
+    let logout_button;
+    loop {
+        // default tab timeout is 20... alternatively change default timeout of tab
+        match tab.wait_for_element("button#logoutButton") {
+            Ok(value) => {
+                logout_button = value;
+                break;
+            },
+            Err(_) => {
+                // wait 
+                wait_counter = wait_counter + 1;
+                println!("Waiting...");
+                if wait_counter > 10 {
+                    println!("Login timedout");
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
     let cookies: Vec<Cookie> = tab.get_cookies().unwrap();
     let mut cookie_str = None;
     for cookie in cookies.iter() {
@@ -63,8 +107,9 @@ async fn main() {
         }
     };
     if cookie_str == None {
-        logout_button.click().unwrap();
-        panic!("Failed to extract cookie from login.");
+        let _ = logout_button.click();
+        println!("Failed to extract cookie from login.");
+        std::process::exit(-1);
     }
 
     let (notary_tls_socket, session_id) =
@@ -221,7 +266,7 @@ async fn main() {
         .await
         .unwrap();
 
-    logout_button.click().unwrap();
+    let _ = logout_button.click();
 }
 
 /// Requests notarization from the Notary server.
