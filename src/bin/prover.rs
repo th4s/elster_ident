@@ -11,7 +11,7 @@ use tokio::time::sleep;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
-use tlsn_core::{commitment::CommitmentKind, proof::TlsProof};
+use tlsn_core::proof::TlsProof;
 use tlsn_prover::tls::{Prover, ProverConfig};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
@@ -100,17 +100,18 @@ async fn main() {
         }
     }
     let cookies: Vec<Cookie> = tab.get_cookies().unwrap();
-    let mut cookie_str = None;
+    let mut session_cookie = None;
     for cookie in cookies.iter() {
         if cookie.name == "JSESSIONID" {
-            cookie_str = Some(format!("{}={}", cookie.name, cookie.value));
+            session_cookie = Some(format!("{}={}", cookie.name, cookie.value));
         }
     };
-    if cookie_str == None {
+    if session_cookie == None {
         let _ = logout_button.click();
         println!("Failed to extract cookie from login.");
         std::process::exit(-1);
     }
+    let session_cookie = session_cookie.unwrap();
 
     let (notary_tls_socket, session_id) =
         request_notarization(NOTARY_HOST, NOTARY_PORT, Some(NOTARY_MAX_TRANSCRIPT_SIZE)).await;
@@ -164,7 +165,7 @@ async fn main() {
             "User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
         )
-        .header("Cookie", cookie_str.unwrap())
+        .header("Cookie", &session_cookie)
         .body(Empty::<Bytes>::new())
         .unwrap();
 
@@ -194,19 +195,26 @@ async fn main() {
     // Upgrade the prover to an HTTP prover, and start notarization.
     let mut prover = prover.start_notarize();
 
-    let sent_len = prover.sent_transcript().data().len();
-    let recv_len = prover.recv_transcript().data().len();
+
+    let sent_public_ranges = find_excluded(
+        prover.sent_transcript().data(),
+        &[session_cookie.as_bytes()]);
+    let recv_public_ranges = find_identity_fields(
+        prover.recv_transcript().data()
+    );
 
     let commitment_builder = prover.commitment_builder();
 
-    let _sent_id = commitment_builder.commit_sent(&Range {
-        start: 0,
-        end: sent_len,
-    });
-    let _recv_id = commitment_builder.commit_recv(&Range {
-        start: 0,
-        end: recv_len,
-    });
+    // Commit to each range of the public outbound data which we want to disclose
+    let sent_commitments: Vec<_> = sent_public_ranges
+        .iter()
+        .map(|range| commitment_builder.commit_sent(range).unwrap())
+        .collect();
+    // Commit to each range of the public inbound data which we want to disclose
+    let recv_commitments: Vec<_> = recv_public_ranges
+        .iter()
+        .map(|range| commitment_builder.commit_recv(range).unwrap())
+        .collect();
 
     // Finalize, returning the notarized HTTP session
     let notarized_session = prover.finalize().await.unwrap();
@@ -229,28 +237,13 @@ async fn main() {
 
     let mut proof_builder = notarized_session.data().build_substrings_proof();
 
-    let sent_len = notarized_session.data().sent_transcript().data().len();
-    let recv_len = notarized_session.data().recv_transcript().data().len();
-
-    proof_builder
-        .reveal_sent(
-            &Range {
-                start: 0,
-                end: sent_len,
-            },
-            CommitmentKind::Blake3,
-        )
-        .unwrap();
-
-    proof_builder
-        .reveal_recv(
-            &Range {
-                start: 0,
-                end: recv_len,
-            },
-            CommitmentKind::Blake3,
-        )
-        .unwrap();
+    // Reveal all the public ranges
+    for commitment_id in sent_commitments {
+        proof_builder.reveal_by_id(commitment_id).unwrap();
+    }
+    for commitment_id in recv_commitments {
+        proof_builder.reveal_by_id(commitment_id).unwrap();
+    }
 
     // Build the proof
     let substrings_proof = proof_builder.build().unwrap();
@@ -386,4 +379,72 @@ pub async fn request_notarization(
         notary_tls_socket.into_inner(),
         notarization_response.session_id,
     )
+}
+
+
+fn find_excluded(seq: &[u8], private_seq: &[&[u8]]) -> Vec<Range<usize>> {
+    let mut private_ranges = Vec::new();
+    for s in private_seq {
+        for (idx, w) in seq.windows(s.len()).enumerate() {
+            if w == *s {
+                private_ranges.push(idx..(idx + w.len()));
+            }
+        }
+    }
+
+    let mut sorted_ranges = private_ranges.clone();
+    sorted_ranges.sort_by_key(|r| r.start);
+
+    let mut public_ranges = Vec::new();
+    let mut last_end = 0;
+    for r in sorted_ranges {
+        if r.start > last_end {
+            public_ranges.push(last_end..r.start);
+        }
+        last_end = r.end;
+    }
+
+    if last_end < seq.len() {
+        public_ranges.push(last_end..seq.len());
+    }
+
+    public_ranges
+}
+
+
+fn find_identity_fields(seq: &[u8]) -> Vec<Range<usize>> {
+    let fields = ["Titel", "Vorname", "Nachname", "Geburtsdatum", "Anschrift"];
+    let close_div = "</div>".as_bytes();
+    let close_symbol = ">".as_bytes();
+    
+    let mut public_ranges = Vec::new();
+    
+    for field in fields.iter() {
+        let field_bytes = field.as_bytes();
+        'outer_id: for (idx, w) in seq.windows(field_bytes.len()).enumerate() {
+            if w == field_bytes {
+                // found field
+                public_ranges.push(idx..idx + w.len());
+                
+                // now find value
+                // skip a </div> now
+                let skip_idx = idx + w.len() + close_div.len() + 1;
+                // a html tag follows < ... > , find where that one closes
+                for (j, symb) in seq.windows(1).skip(skip_idx).enumerate() {
+                    if symb == close_symbol {
+                        // idx+j+1 is start_idx
+                        // value ends with an </div>, when that comes the range ends
+                        for (k, w2) in seq.windows(close_div.len()).skip(skip_idx).enumerate() {
+                            if w2 == close_div {
+                                public_ranges.push(skip_idx+j+1..skip_idx+k);
+                                break 'outer_id;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public_ranges
 }
