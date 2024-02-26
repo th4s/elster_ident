@@ -17,6 +17,10 @@ use tokio_rustls::TlsConnector;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::debug;
 
+use headless_chrome::{Browser, protocol::cdp::Network::Cookie};
+use qr2term;
+
+
 // Setting of the application server
 const SERVER_DOMAIN: &str = "www.elster.de";
 
@@ -30,6 +34,38 @@ const NOTARY_MAX_TRANSCRIPT_SIZE: usize = 360000;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    let browser = Browser::default().unwrap();
+    let tab = browser.new_tab().unwrap();
+
+    tab.navigate_to("https://www.elster.de/eportal/login/elstersecure").unwrap();
+
+    let qr_element = tab.wait_for_element("div#elsterSecure-data").unwrap();
+    let div_attribute = qr_element.get_attribute_value("data-client-uri").unwrap();
+    let qr_code;
+    loop {
+        match div_attribute {
+            Some(value) => {
+                qr_code = value;
+                break;
+            },
+            None => {}
+        }
+    }
+
+    qr2term::print_qr(qr_code).unwrap();
+    let logout_button = tab.wait_for_element("button#logoutButton").unwrap();
+    let cookies: Vec<Cookie> = tab.get_cookies().unwrap();
+    let mut cookie_str = None;
+    for cookie in cookies.iter() {
+        if cookie.name == "JSESSIONID" {
+            cookie_str = Some(format!("{}={}", cookie.name, cookie.value));
+        }
+    };
+    if cookie_str == None {
+        logout_button.click().unwrap();
+        panic!("Failed to extract cookie from login.");
+    }
 
     let (notary_tls_socket, session_id) =
         request_notarization(NOTARY_HOST, NOTARY_PORT, Some(NOTARY_MAX_TRANSCRIPT_SIZE)).await;
@@ -70,7 +106,6 @@ async fn main() {
     // Spawn the HTTP task to be run concurrently
     tokio::spawn(connection);
 
-    let cookie_str = std::env::var("COOKIE").unwrap();
     // Build a simple HTTP request
     let request = Request::builder()
         .uri("/eportal/meinestammdaten")
@@ -84,7 +119,7 @@ async fn main() {
             "User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
         )
-        .header("Cookie", cookie_str)
+        .header("Cookie", cookie_str.unwrap())
         .body(Empty::<Bytes>::new())
         .unwrap();
 
@@ -185,6 +220,8 @@ async fn main() {
     file.write_all(serde_json::to_string_pretty(&proof).unwrap().as_bytes())
         .await
         .unwrap();
+
+    logout_button.click().unwrap();
 }
 
 /// Requests notarization from the Notary server.
