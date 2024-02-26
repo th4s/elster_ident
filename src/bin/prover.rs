@@ -413,22 +413,31 @@ fn find_excluded(seq: &[u8], private_seq: &[&[u8]]) -> Vec<Range<usize>> {
 
 
 fn find_identity_fields(seq: &[u8]) -> Vec<Range<usize>> {
-    let fields = ["Titel", "Vorname", "Nachname", "Geburtsdatum", "Anschrift"];
+    let fields = ["Identifikationsnummer", "Titel", "Vorname", "Nachname", "Geburtsdatum", "Anschrift"];
     let close_div = "</div>".as_bytes();
     let close_symbol = ">".as_bytes();
     
     let mut public_ranges = Vec::new();
-    
+    // find start idx
+    let start_txt = "Angaben zur Person".as_bytes();
+
+    let mut start_idx = 0;
+    for (idx, w) in seq.windows(start_txt.len()).enumerate() {
+        if w == start_txt {
+            start_idx = idx;
+            break;
+        }
+    }
     for field in fields.iter() {
         let field_bytes = field.as_bytes();
-        'outer_id: for (idx, w) in seq.windows(field_bytes.len()).enumerate() {
+        'outer_id: for (idx, w) in seq.windows(field_bytes.len()).skip(start_idx).enumerate() {
             if w == field_bytes {
                 // found field
-                public_ranges.push(idx..idx + w.len());
+                public_ranges.push(start_idx + idx..start_idx + idx + w.len());
                 
                 // now find value
                 // skip a </div> now
-                let skip_idx = idx + w.len() + close_div.len() + 1;
+                let skip_idx = start_idx + idx + w.len() + close_div.len() + 1;
                 // a html tag follows < ... > , find where that one closes
                 for (j, symb) in seq.windows(1).skip(skip_idx).enumerate() {
                     if symb == close_symbol {
